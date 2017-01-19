@@ -26,6 +26,9 @@ resource "aws_instance" "web" {
         "puppet apply",
         "consul join ${aws_instance.web.private_ip}"
         ]
+        verify = [
+        "consul members",
+        ]
     }
 }
 ```
@@ -44,6 +47,10 @@ The following arguments are supported:
 * `scripts` - This is a list of paths (relative or absolute) to local scripts
   that will be copied to the remote resource and then executed. They are executed
   in the order they are provided. This cannot be provided with `inline` or `script`.
+  
+* `verify` - This is a list of command strings. Used to verify that the execution
+ scripts (Either: `inline`, `script`, or `scripts`) executed correctly.
+
 
 ## Script Arguments
 

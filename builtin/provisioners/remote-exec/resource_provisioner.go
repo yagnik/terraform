@@ -31,6 +31,8 @@ func (p *ResourceProvisioner) Apply(
 	}
 
 	// Collect the scripts
+	// This should happen first, so we catch any configuration errors before
+	// establishing a connection
 	scripts, err := p.collectScripts(c)
 	if err != nil {
 		return err
@@ -39,10 +41,42 @@ func (p *ResourceProvisioner) Apply(
 		defer s.Close()
 	}
 
-	// Copy and execute each script
-	if err := p.runScripts(o, comm, scripts); err != nil {
+	// Collect verification scripts if needed
+	var verifyScripts []io.ReadCloser
+	_, verifyOk := c.Config["verify"]
+	if verifyOk {
+		verifyScripts, err = p.collectVerification(c)
+		if err != nil {
+			return err
+		}
+		for _, s := range verifyScripts {
+			defer s.Close()
+		}
+	}
+
+	// Wait and retry until we establish a connection
+	err = retryFunc(comm.Timeout(), func() error {
+		err := comm.Connect(o)
+		return err
+	})
+	if err != nil {
 		return err
 	}
+	defer comm.Disconnect()
+
+	// Copy and execute each script
+	if err := p.runScripts(false, o, comm, scripts); err != nil {
+		return err
+	}
+
+	// If verify is specified, verify that the exec scripts need to be ran
+	if verifyOk {
+		if err := p.runScripts(true, o, comm, verifyScripts); err != nil {
+			// better message
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -53,6 +87,8 @@ func (p *ResourceProvisioner) Validate(c *terraform.ResourceConfig) (ws []string
 		switch name {
 		case "scripts", "script", "inline":
 			num++
+		case "verify":
+			continue
 		default:
 			es = append(es, fmt.Errorf("Unknown configuration '%s'", name))
 		}
@@ -63,41 +99,13 @@ func (p *ResourceProvisioner) Validate(c *terraform.ResourceConfig) (ws []string
 	return
 }
 
-// generateScript takes the configuration and creates a script to be executed
-// from the inline configs
-func (p *ResourceProvisioner) generateScript(c *terraform.ResourceConfig) (string, error) {
-	var lines []string
-	command, ok := c.Config["inline"]
-	if ok {
-		switch cmd := command.(type) {
-		case string:
-			lines = append(lines, cmd)
-		case []string:
-			lines = append(lines, cmd...)
-		case []interface{}:
-			for _, l := range cmd {
-				lStr, ok := l.(string)
-				if ok {
-					lines = append(lines, lStr)
-				} else {
-					return "", fmt.Errorf("Unsupported 'inline' type! Must be string, or list of strings.")
-				}
-			}
-		default:
-			return "", fmt.Errorf("Unsupported 'inline' type! Must be string, or list of strings.")
-		}
-	}
-	lines = append(lines, "")
-	return strings.Join(lines, "\n"), nil
-}
-
 // collectScripts is used to collect all the scripts we need
 // to execute in preparation for copying them.
 func (p *ResourceProvisioner) collectScripts(c *terraform.ResourceConfig) ([]io.ReadCloser, error) {
 	// Check if inline
 	_, ok := c.Config["inline"]
 	if ok {
-		script, err := p.generateScript(c)
+		script, err := joinLines(c, "inline")
 		if err != nil {
 			return nil, err
 		}
@@ -152,20 +160,28 @@ func (p *ResourceProvisioner) collectScripts(c *terraform.ResourceConfig) ([]io.
 	return fhs, nil
 }
 
+// collectVerification is used to collect all the scripts needed for
+// verification.
+func (p *ResourceProvisioner) collectVerification(c *terraform.ResourceConfig) ([]io.ReadCloser, error) {
+	script, err := joinLines(c, "verify")
+	if err != nil {
+		return nil, err
+	}
+	rc := ioutil.NopCloser(bytes.NewReader([]byte(script)))
+	return []io.ReadCloser{rc}, nil
+}
+
 // runScripts is used to copy and execute a set of scripts
 func (p *ResourceProvisioner) runScripts(
+	verify bool,
 	o terraform.UIOutput,
 	comm communicator.Communicator,
 	scripts []io.ReadCloser) error {
-	// Wait and retry until we establish the connection
-	err := retryFunc(comm.Timeout(), func() error {
-		err := comm.Connect(o)
-		return err
-	})
-	if err != nil {
-		return err
+
+	action := "execution"
+	if verify {
+		action = "verification"
 	}
-	defer comm.Disconnect()
 
 	for _, script := range scripts {
 		var cmd *remote.Cmd
@@ -177,9 +193,9 @@ func (p *ResourceProvisioner) runScripts(
 		go p.copyOutput(o, errR, errDoneCh)
 
 		remotePath := comm.ScriptPath()
-		err = retryFunc(comm.Timeout(), func() error {
+		err := retryFunc(comm.Timeout(), func() error {
 			if err := comm.UploadScript(remotePath, script); err != nil {
-				return fmt.Errorf("Failed to upload script: %v", err)
+				return fmt.Errorf("Failed to upload %s script: %v", action, err)
 			}
 
 			cmd = &remote.Cmd{
@@ -188,7 +204,7 @@ func (p *ResourceProvisioner) runScripts(
 				Stderr:  errW,
 			}
 			if err := comm.Start(cmd); err != nil {
-				return fmt.Errorf("Error starting script: %v", err)
+				return fmt.Errorf("Error starting %s script: %v", action, err)
 			}
 
 			return nil
@@ -196,7 +212,8 @@ func (p *ResourceProvisioner) runScripts(
 		if err == nil {
 			cmd.Wait()
 			if cmd.ExitStatus != 0 {
-				err = fmt.Errorf("Script exited with non-zero exit status: %d", cmd.ExitStatus)
+				err = fmt.Errorf("%s Script exited with non-zero exit status: %d",
+					strings.Title(action), cmd.ExitStatus)
 			}
 		}
 
@@ -248,4 +265,32 @@ func retryFunc(timeout time.Duration, f func() error) error {
 		case <-time.After(3 * time.Second):
 		}
 	}
+}
+
+// joinLines takes a config value, and regardless of the type,
+// returns a string of values with newline separators
+func joinLines(c *terraform.ResourceConfig, key string) (string, error) {
+	var lines []string
+	command, ok := c.Config[key]
+	if ok {
+		switch cmd := command.(type) {
+		case string:
+			lines = append(lines, cmd)
+		case []string:
+			lines = append(lines, cmd...)
+		case []interface{}:
+			for _, l := range cmd {
+				lStr, ok := l.(string)
+				if ok {
+					lines = append(lines, lStr)
+				} else {
+					return "", fmt.Errorf("Unsupported '%s' type! Must be string, or list of strings.", key)
+				}
+			}
+		default:
+			return "", fmt.Errorf("Unsupported '%s' type! Must be string, or list of strings.", key)
+		}
+	}
+	lines = append(lines, "")
+	return strings.Join(lines, "\n"), nil
 }

@@ -25,6 +25,7 @@ resource "aws_instance" "web" {
     ...
     provisioner "local-exec" {
         command = "echo ${aws_instance.web.private_ip} >> private_ips.txt"
+        verify  = "grep -q ${aws_instance.web.private_ip} private_ips.txt"
     }
 }
 ```
@@ -38,3 +39,5 @@ The following arguments are supported:
   It is evaluated in a shell, and can use environment variables or Terraform
   variables.
 
+* `verify` - (Optional) This is the command to verify if the above command
+executed successfully or not. 
